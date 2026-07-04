@@ -105,6 +105,7 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "minicpmv4_6": create(MiniCPMV46Configuration.self, MiniCPMV46.init),
     ])
 }
 
@@ -140,6 +141,10 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
+        "MiniCPMVProcessor": create(
+            MiniCPMVProcessorConfiguration.self, MiniCPMVProcessor.init),
+        "MiniCPMV4_6Processor": create(
+            MiniCPMVProcessorConfiguration.self, MiniCPMVProcessor.init),
     ])
 }
 
@@ -268,6 +273,12 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let minicpmV46_4bit = ModelConfiguration(
+        id: "mlx-community/MiniCPM-V-4.6-4bit",
+        defaultPrompt: "Describe this image.",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -287,6 +298,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             fastvlm,
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
+            minicpmV46_4bit,
         ]
     }
 
@@ -336,6 +348,12 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
+        let loadClock = ContinuousClock()
+        let loadStart = loadClock.now
+        func stamp(_ label: String, since: ContinuousClock.Instant) {
+            let ms = (loadClock.now - since).components.attoseconds / 1_000_000_000_000_000
+            print("[VLM load] \(label): \(ms) ms")
+        }
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -391,15 +409,21 @@ public final class VLMModelFactory: GenericModelFactory {
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
         // parallel scheduling. This may briefly block a cooperative thread pool thread,
         // but the config file is small and model loading is not a high-concurrency path.
+        stamp("config decode + model init", since: loadStart)
+
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
+        let weightsStart = loadClock.now
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization)
+        stamp("weights (2.2 GB safetensors + quantized layers)", since: weightsStart)
 
+        let tokenizerStart = loadClock.now
         let tokenizer = try await tokenizerTask
+        stamp("tokenizer (residual wait after weights)", since: tokenizerStart)
         let processorConfigData: Data
         let baseProcessorConfig: BaseProcessorConfiguration
         do {
@@ -441,6 +465,7 @@ public final class VLMModelFactory: GenericModelFactory {
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat)
 
+        stamp("TOTAL _load", since: loadStart)
         return .init(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
