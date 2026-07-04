@@ -41,8 +41,23 @@ let package = Package(
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
+        // swift-transformers / swift-huggingface are used only by the
+        // minicpm-harness executable (tokenizer loading + hub download).
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
     ],
     targets: [
+        .executableTarget(
+            name: "minicpm-harness",
+            dependencies: [
+                "MLXVLM",
+                "MLXLMCommon",
+                "MLXHuggingFace",
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+            ],
+            path: "Tools/minicpm-harness"
+        ),
         .target(
             name: "MLXLLM",
             dependencies: [
