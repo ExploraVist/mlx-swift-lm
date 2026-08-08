@@ -602,6 +602,72 @@ public class MiniCPMV46: Module, VLMModel {
         return flat.expandedDimensions(axis: 0)
     }
 
+    // MARK: - Labs split execution (ExploraVist execution-schedule experiments)
+    //
+    // `prepare(_:cache:windowSize:)` fuses vision encode and the LLM forward.
+    // These two calls expose the same computation split at the natural
+    // boundary so a caller can (a) time the halves separately and (b) release
+    // the vision half after `labsEncodeImage` returns — nothing below the
+    // split touches vision weights, and nothing above touches LLM weights.
+
+    /// Vision half only: tower + VitMerger + Merger over the input's packed
+    /// strips. Returns concatenated features [nImageTokens, llmHidden],
+    /// evaluated (materialized) so the vision weights may be released
+    /// immediately afterwards.
+    public func labsEncodeImage(_ input: LMInput) throws -> MLXArray {
+        guard let image = input.image, let frames = image.frames, !frames.isEmpty else {
+            throw MiniCPMV46Error.imageProcessingFailed("labsEncodeImage: input has no image")
+        }
+        var pixels = image.pixels
+        if pixels.ndim == 4 {
+            pixels = pixels[0]
+        }
+        let patch = pixels.dim(0)
+
+        var features: [MLXArray] = []
+        var cursor = 0
+        for frame in frames {
+            let h = frame.h
+            let w = frame.w
+            let widthPx = h * w * patch
+            let strip = pixels[0..., cursor ..< (cursor + widthPx), 0...]
+            cursor += widthPx
+            features.append(visionFeatures(strip: strip, h: h, w: w))
+        }
+        let imageFeatures = concatenated(features, axis: 0)
+        eval(imageFeatures)
+        return imageFeatures
+    }
+
+    /// LLM half only: embed tokens, scatter `imageFeatures` into the
+    /// `<|image_pad|>` positions (when given), and run one forward pass into
+    /// `cache`, discarding logits (prefill-only). The cache is evaluated
+    /// before returning. Decode by passing the follow-on tokens plus this
+    /// cache to `generateTokens`/`TokenIterator`.
+    public func labsPrefill(
+        _ input: LMInput, imageFeatures: MLXArray?, cache: [any KVCache]
+    ) throws {
+        var inputIds = input.text.tokens
+        if inputIds.ndim == 1 {
+            inputIds = inputIds.expandedDimensions(axis: 0)
+        }
+
+        var inputEmbeddings: MLXArray? = nil
+        if let imageFeatures {
+            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            inputEmbeddings = try scatterImageFeatures(
+                features: imageFeatures.asType(textEmbeds.dtype),
+                embeds: textEmbeds,
+                inputIds: inputIds,
+                placeholderId: config.imageTokenId
+            )
+        }
+
+        let typedCache: [KVCache?]? = cache.isEmpty ? nil : cache.map { $0 }
+        _ = languageModel(inputIds, inputsEmbeds: inputEmbeddings, cache: typedCache)
+        eval(cache)
+    }
+
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {
@@ -874,8 +940,34 @@ public final class MiniCPMVProcessor: UserInputProcessor {
         }
 
         // Image path (single image supported; first image used)
-        let ciImage = try input.images[0].asCIImage()
-        let oriented = MediaProcessing.apply(ciImage, processing: input.processing)
+        let (strips, frames, grid) = try processImageBlocks(input.images[0], processing: input.processing)
+
+        // Assemble token ids:
+        // <|im_start|>user\n ( [image blocks] )\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+        var ids: [Int] = [imStartId]
+        ids += encode("user\n(")
+        ids += imageBlockIds(frames: frames, grid: grid)
+        ids += encode(")\n" + prompt)
+        ids += [imEndId]
+        ids += encode("\n")
+        ids += [imStartId]
+        ids += encode("assistant\n<think>\n\n</think>\n\n")
+
+        let pixels = concatenated(strips, axis: 1).expandedDimensions(axis: 0)
+
+        return LMInput(
+            text: .init(tokens: MLXArray(ids.map { Int32($0) }).expandedDimensions(axis: 0)),
+            image: .init(pixels: pixels, frames: frames)
+        )
+    }
+
+    /// Slice the image and pack per-frame strips. Behavior identical to the
+    /// former inline body of `prepare(input:)`.
+    private func processImageBlocks(
+        _ image: UserInput.Image, processing: UserInput.Processing?
+    ) throws -> (strips: [MLXArray], frames: [THW], grid: (x: Int, y: Int)?) {
+        let ciImage = try image.asCIImage()
+        let oriented = MediaProcessing.apply(ciImage, processing: processing)
         let size = (
             w: Int(oriented.extent.width.rounded()), h: Int(oriented.extent.height.rounded())
         )
@@ -929,10 +1021,14 @@ public final class MiniCPMVProcessor: UserInputProcessor {
             frames.append(THW(1, oh, ow))
         }
 
-        // Assemble token ids:
-        // <|im_start|>user\n ( [image blocks] )\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
-        var ids: [Int] = [imStartId]
-        ids += encode("user\n(")
+        return (strips, frames, grid)
+    }
+
+    /// The `<image_id>…</image_id><image>…</image><slice>…</slice>` id block
+    /// between "user\n(" and ")\n". Behavior identical to the former inline
+    /// body of `prepare(input:)`.
+    private func imageBlockIds(frames: [THW], grid: (x: Int, y: Int)?) -> [Int] {
+        var ids: [Int] = []
 
         // <image_id>0</image_id>
         if config.useImageId {
@@ -963,17 +1059,74 @@ public final class MiniCPMVProcessor: UserInputProcessor {
             }
         }
 
-        ids += encode(")\n" + prompt)
+        return ids
+    }
+
+    // MARK: - Labs split-prompt API (ExploraVist execution-schedule experiments)
+
+    /// A prompt split at the image/question boundary so [system + image] can be
+    /// prefilled into a KV cache before the question exists.
+    ///
+    /// Guarantee: `full.text.tokens == prefix.text.tokens ++ suffixIDs` — the
+    /// split point sits between the image-block special ids and the `")\n"`
+    /// encode, so no tokenizer merge can cross it. A cache prefilled with
+    /// `prefix` is therefore a valid prefix cache for `full`.
+    public struct LabsParts {
+        /// [system turn][<|im_start|>user\n(][image blocks] — pixels attached.
+        public let prefix: LMInput
+        /// [")\n"+question][<|im_end|>\n][<|im_start|>assistant…think block]
+        public let suffixIDs: [Int]
+        /// The whole sequence in one LMInput (for the cold/baseline arm).
+        public let full: LMInput
+    }
+
+    /// Chat-template order is system → image → question; that order is what
+    /// makes the prefix cache valid. `question` nil/empty = describe mode.
+    public func labsPrepare(
+        image: UserInput.Image,
+        processing: UserInput.Processing? = nil,
+        system: String,
+        question: String?
+    ) throws -> LabsParts {
+        let (strips, frames, grid) = try processImageBlocks(image, processing: processing)
+        let pixels = concatenated(strips, axis: 1).expandedDimensions(axis: 0)
+
+        var prefixIds: [Int] = [imStartId]
+        prefixIds += encode("system\n" + system)
+        prefixIds += [imEndId]
+        prefixIds += encode("\n")
+        prefixIds += [imStartId]
+        prefixIds += encode("user\n(")
+        prefixIds += imageBlockIds(frames: frames, grid: grid)
+
+        var suffixIds: [Int] = encode(")\n" + (question ?? ""))
+        suffixIds += [imEndId]
+        suffixIds += encode("\n")
+        suffixIds += [imStartId]
+        suffixIds += encode("assistant\n<think>\n\n</think>\n\n")
+
+        func lmInput(_ ids: [Int], withImage: Bool) -> LMInput {
+            LMInput(
+                text: .init(tokens: MLXArray(ids.map { Int32($0) }).expandedDimensions(axis: 0)),
+                image: withImage ? .init(pixels: pixels, frames: frames) : nil
+            )
+        }
+
+        return LabsParts(
+            prefix: lmInput(prefixIds, withImage: true),
+            suffixIDs: suffixIds,
+            full: lmInput(prefixIds + suffixIds, withImage: true)
+        )
+    }
+
+    /// Suffix-only ids for asking another question of an already-prefilled
+    /// prefix cache (same layout as `LabsParts.suffixIDs`).
+    public func labsSuffixIDs(question: String?) -> [Int] {
+        var ids: [Int] = encode(")\n" + (question ?? ""))
         ids += [imEndId]
         ids += encode("\n")
         ids += [imStartId]
         ids += encode("assistant\n<think>\n\n</think>\n\n")
-
-        let pixels = concatenated(strips, axis: 1).expandedDimensions(axis: 0)
-
-        return LMInput(
-            text: .init(tokens: MLXArray(ids.map { Int32($0) }).expandedDimensions(axis: 0)),
-            image: .init(pixels: pixels, frames: frames)
-        )
+        return ids
     }
 }
