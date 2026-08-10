@@ -506,6 +506,89 @@ public class MiniCPMV46: Module, VLMModel {
         languageModel.makeCache()
     }
 
+    /// Per-encoder-layer hook for Labs weight streaming (Test 3).
+    ///
+    /// The vision tower is 823 MB of BF16 and, under dynamic residency, is
+    /// the phase that sets the request peak. Streaming loads one layer at a
+    /// time and frees it after use, so peak holds only the activations plus
+    /// a couple of layers instead of the whole tower.
+    ///
+    /// `willUse` runs before layer `i` executes and must leave that layer's
+    /// parameters attached; `didUse` runs after, and may release them. Both
+    /// are nil in the normal path, so production behaviour is byte-identical
+    /// — this compiles to two nil checks per layer.
+    /// The layer module is handed over so the callee can attach/release
+    /// parameters on THAT module alone. Updating the whole model from inside
+    /// this loop mutates the tree being enumerated and walks every parameter
+    /// in the model once per layer — unsafe, and slow enough to matter.
+    public struct LabsLayerStream {
+        public var willUse: (Int, Module) -> Void
+        public var didUse: (Int, Module) -> Void
+        public init(willUse: @escaping (Int, Module) -> Void,
+                    didUse: @escaping (Int, Module) -> Void) {
+            self.willUse = willUse
+            self.didUse = didUse
+        }
+    }
+    public var labsLayerStream: LabsLayerStream?
+
+    /// Number of vision encoder layers, so Labs can address them by index.
+    public var labsVisionLayerCount: Int { visionTower.encoder.layers.count }
+
+    /// Labs Test 3: the same computation as `visionFeatures`, with the loop
+    /// nest INVERTED — layers outside, strips inside.
+    ///
+    /// visionFeatures runs per strip, so a 9-strip image walks all 27 encoder
+    /// layers nine times. Under weight streaming that is 243 layer loads and
+    /// ~7 GB of reads, and each load (~12 ms) has only one strip of compute
+    /// (~6 ms) to hide behind — the prefetch can never get ahead. Measured:
+    /// 1 hit / 242 misses, 3.1 s stalled, vision 1535 -> 4956 ms.
+    ///
+    /// Visiting each layer once and pushing every strip through it makes that
+    /// 27 loads and ~823 MB, with ~57 ms of compute per 12 ms load. Identical
+    /// arithmetic per strip — layers are stateless w.r.t. strips, so order of
+    /// traversal cannot change the result, which the parity check confirms.
+    ///
+    /// vitMerger fires mid-stack at `insertLayerId` and rewrites each strip's
+    /// grid, so grids are carried per strip rather than as a single value.
+    private func visionFeaturesStreamed(strips: [(MLXArray, Int, Int)]) -> [MLXArray] {
+        var hidden: [MLXArray] = strips.map { (strip, h, w) in
+            visionTower.embeddings(strip: strip, h: h, w: w)
+                .expandedDimensions(axis: 0)
+        }
+        var gridH = strips.map(\.1)
+        var gridW = strips.map(\.2)
+
+        for (index, layer) in visionTower.encoder.layers.enumerated() {
+            labsLayerStream?.willUse(index, layer)
+
+            for s in hidden.indices {
+                hidden[s] = layer(hidden[s])
+                if index == config.insertLayerId {
+                    let (merged, mh, mw) = vitMerger(
+                        hidden[s][0], gridH: gridH[s], gridW: gridW[s])
+                    hidden[s] = merged.expandedDimensions(axis: 0)
+                    gridH[s] = mh
+                    gridW[s] = mw
+                }
+            }
+
+            if let stream = labsLayerStream {
+                // Every strip's output must be materialized before the
+                // layer's weights are dropped — MLX is lazy, so otherwise the
+                // graph still references buffers we are about to release.
+                eval(hidden)
+                stream.didUse(index, layer)
+            }
+        }
+
+        return hidden.indices.map { s in
+            let h = visionTower.postLayerNorm(hidden[s])[0]
+            let (tokens, _, _) = merger(h, gridH: gridH[s], gridW: gridW[s])
+            return tokens
+        }
+    }
+
     /// Run one packed slice through the vision tower (VitMerger inserted at
     /// `insertLayerId`) and the final Merger. Returns [tokens, llmHidden].
     private func visionFeatures(strip: MLXArray, h: Int, w: Int) -> MLXArray {
@@ -624,16 +707,24 @@ public class MiniCPMV46: Module, VLMModel {
         }
         let patch = pixels.dim(0)
 
-        var features: [MLXArray] = []
+        // Slice first, then dispatch. With streaming on we take the inverted
+        // path so each encoder layer is loaded once for ALL strips instead of
+        // once per strip — 27 loads rather than 243.
+        var strips: [(MLXArray, Int, Int)] = []
         var cursor = 0
         for frame in frames {
             let h = frame.h
             let w = frame.w
             let widthPx = h * w * patch
-            let strip = pixels[0..., cursor ..< (cursor + widthPx), 0...]
+            strips.append((pixels[0..., cursor ..< (cursor + widthPx), 0...], h, w))
             cursor += widthPx
-            features.append(visionFeatures(strip: strip, h: h, w: w))
         }
+
+        let features: [MLXArray] =
+            labsLayerStream != nil
+            ? visionFeaturesStreamed(strips: strips)
+            : strips.map { visionFeatures(strip: $0.0, h: $0.1, w: $0.2) }
+
         let imageFeatures = concatenated(features, axis: 0)
         eval(imageFeatures)
         return imageFeatures
