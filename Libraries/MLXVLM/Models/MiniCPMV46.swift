@@ -533,12 +533,23 @@ public class MiniCPMV46: Module, VLMModel {
         /// chunk size never showed up in the timings — the sync cost was
         /// constant across settings and swamped the difference.
         public var needsEval: (Int) -> Bool
+        /// Called once the embeddings have produced every strip's hidden
+        /// state. `visionTower.embeddings` is not touched again this encode.
+        public var didFinishEmbeddings: () -> Void = {}
+        /// Called after the vitMerger pass at `insertLayerId` (which is 6 of
+        /// 27), so its ~209 MB is dead for the remaining 21 layers rather
+        /// than held until the encode ends.
+        public var didFinishVitMerger: () -> Void = {}
         public init(willUse: @escaping (Int, Module) -> Void,
                     didUse: @escaping (Int, Module) -> Void,
-                    needsEval: @escaping (Int) -> Bool = { _ in true }) {
+                    needsEval: @escaping (Int) -> Bool = { _ in true },
+                    didFinishEmbeddings: @escaping () -> Void = {},
+                    didFinishVitMerger: @escaping () -> Void = {}) {
             self.willUse = willUse
             self.didUse = didUse
             self.needsEval = needsEval
+            self.didFinishEmbeddings = didFinishEmbeddings
+            self.didFinishVitMerger = didFinishVitMerger
         }
     }
 
@@ -580,6 +591,11 @@ public class MiniCPMV46: Module, VLMModel {
         var gridH = strips.map(\.1)
         var gridW = strips.map(\.2)
 
+        if let stream = labsLayerStream {
+            eval(hidden)                    // embeddings output materialized
+            stream.didFinishEmbeddings()    // ~13 MB, dead from here
+        }
+
         // Strips that share a token count can go through a layer together.
         // Grouped up front so the grouping cost is paid once, not per layer.
         let groups: [[Int]] = labsBatchStrips
@@ -613,6 +629,15 @@ public class MiniCPMV46: Module, VLMModel {
                         gridW[s] = mw
                     }
                 }
+            }
+
+            if index == config.insertLayerId, let stream = labsLayerStream {
+                // Every strip has been merged; vitMerger has no further use
+                // this encode. At insertLayerId = 6 of 27 that frees ~209 MB
+                // for the remaining 21 layers — exactly the window where the
+                // LLM prefetch lands.
+                eval(hidden)
+                stream.didFinishVitMerger()
             }
 
             if let stream = labsLayerStream {
