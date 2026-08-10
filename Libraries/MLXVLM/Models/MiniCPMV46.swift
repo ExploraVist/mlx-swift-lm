@@ -524,12 +524,33 @@ public class MiniCPMV46: Module, VLMModel {
     public struct LabsLayerStream {
         public var willUse: (Int, Module) -> Void
         public var didUse: (Int, Module) -> Void
+        /// Whether this layer's output must be materialized before didUse.
+        /// Only true when weights are about to be released — MLX is lazy, so
+        /// an eval is required then and only then.
+        ///
+        /// Previously eval() ran after EVERY layer regardless of chunk size:
+        /// 27 GPU syncs where chunk 9 needs 3. That is almost certainly why
+        /// chunk size never showed up in the timings — the sync cost was
+        /// constant across settings and swamped the difference.
+        public var needsEval: (Int) -> Bool
         public init(willUse: @escaping (Int, Module) -> Void,
-                    didUse: @escaping (Int, Module) -> Void) {
+                    didUse: @escaping (Int, Module) -> Void,
+                    needsEval: @escaping (Int) -> Bool = { _ in true }) {
             self.willUse = willUse
             self.didUse = didUse
+            self.needsEval = needsEval
         }
     }
+
+    /// Batch same-shaped strips through each encoder layer instead of running
+    /// them one at a time.
+    ///
+    /// processImageBlocks emits one overview strip plus grid.x*grid.y refined
+    /// slices that are ALL exactly cellW x cellH, so a 9-strip image is 1
+    /// overview + 8 identical slices. The 8 stack into [8, n, D] and go
+    /// through a layer in a single call: 9 sequential matmuls become 2.
+    /// Applies to the normal path as well as the streamed one.
+    public var labsBatchStrips = false
     public var labsLayerStream: LabsLayerStream?
 
     /// Number of vision encoder layers, so Labs can address them by index.
@@ -559,25 +580,44 @@ public class MiniCPMV46: Module, VLMModel {
         var gridH = strips.map(\.1)
         var gridW = strips.map(\.2)
 
+        // Strips that share a token count can go through a layer together.
+        // Grouped up front so the grouping cost is paid once, not per layer.
+        let groups: [[Int]] = labsBatchStrips
+            ? Dictionary(grouping: hidden.indices) { hidden[$0].dim(1) }
+                .values.map { $0.sorted() }.sorted { $0[0] < $1[0] }
+            : hidden.indices.map { [$0] }
+
         for (index, layer) in visionTower.encoder.layers.enumerated() {
             labsLayerStream?.willUse(index, layer)
 
-            for s in hidden.indices {
-                hidden[s] = layer(hidden[s])
+            for group in groups {
+                if group.count == 1 {
+                    let s = group[0]
+                    hidden[s] = layer(hidden[s])
+                } else {
+                    // [g, n, D] in one call instead of g calls.
+                    let batch = concatenated(group.map { hidden[$0] }, axis: 0)
+                    let out = layer(batch)
+                    for (k, s) in group.enumerated() {
+                        hidden[s] = out[k ..< (k + 1)]
+                    }
+                }
                 if index == config.insertLayerId {
-                    let (merged, mh, mw) = vitMerger(
-                        hidden[s][0], gridH: gridH[s], gridW: gridW[s])
-                    hidden[s] = merged.expandedDimensions(axis: 0)
-                    gridH[s] = mh
-                    gridW[s] = mw
+                    // vitMerger is per-strip (it rewrites each grid), so the
+                    // batch is split here and regrouped on the next layer.
+                    for s in group {
+                        let (merged, mh, mw) = vitMerger(
+                            hidden[s][0], gridH: gridH[s], gridW: gridW[s])
+                        hidden[s] = merged.expandedDimensions(axis: 0)
+                        gridH[s] = mh
+                        gridW[s] = mw
+                    }
                 }
             }
 
             if let stream = labsLayerStream {
-                // Every strip's output must be materialized before the
-                // layer's weights are dropped — MLX is lazy, so otherwise the
-                // graph still references buffers we are about to release.
-                eval(hidden)
+                // Materialize only when this layer is about to be released.
+                if stream.needsEval(index) { eval(hidden) }
                 stream.didUse(index, layer)
             }
         }
@@ -720,8 +760,11 @@ public class MiniCPMV46: Module, VLMModel {
             cursor += widthPx
         }
 
+        // Streaming implies the inverted loop. Batching alone also uses it,
+        // since batching same-shaped strips is only expressible with strips
+        // on the inside — visionFeatures handles exactly one strip.
         let features: [MLXArray] =
-            labsLayerStream != nil
+            (labsLayerStream != nil || labsBatchStrips)
             ? visionFeaturesStreamed(strips: strips)
             : strips.map { visionFeatures(strip: $0.0, h: $0.1, w: $0.2) }
 
