@@ -1207,11 +1207,23 @@ public final class MiniCPMVProcessor: UserInputProcessor {
     /// `prefix` is therefore a valid prefix cache for `full`.
     public struct LabsParts {
         /// [system turn][<|im_start|>user\n(][image blocks] — pixels attached.
-        public let prefix: LMInput
+        public var prefix: LMInput
         /// [")\n"+question][<|im_end|>\n][<|im_start|>assistant…think block]
         public let suffixIDs: [Int]
         /// The whole sequence in one LMInput (for the cold/baseline arm).
-        public let full: LMInput
+        public var full: LMInput
+
+        /// Drop the packed pixel strips once the encode is done.
+        ///
+        /// They feed visionTower.embeddings and nothing else — labsPrefill
+        /// reads only input.text.tokens. Holding them through prefill and
+        /// decode keeps a 9-strip image resident for the whole request for no
+        /// reason. Releasing the last reference lets MLX reclaim it before
+        /// prefill, which is the phase that now sets the peak.
+        public mutating func releaseImagePixels() {
+            prefix = LMInput(text: prefix.text, image: nil)
+            full = LMInput(text: full.text, image: nil)
+        }
     }
 
     /// Chat-template order is system → image → question; that order is what
