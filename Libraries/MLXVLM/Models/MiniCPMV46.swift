@@ -929,8 +929,26 @@ public class MiniCPMV46: Module, VLMModel {
     /// `cache`, discarding logits (prefill-only). The cache is evaluated
     /// before returning. Decode by passing the follow-on tokens plus this
     /// cache to `generateTokens`/`TokenIterator`.
+    /// - Parameter chunkSize: prompt positions per forward pass. 0 (default)
+    ///   is one pass over the whole prompt, exactly as before.
+    ///
+    ///   Chunking is mathematically identical: attention is causal and the
+    ///   cache is built left to right, so tokens 0..<k can be prefilled before
+    ///   k exists. Every chunk still attends to everything before it, already
+    ///   in the cache.
+    ///
+    ///   On its own it is slightly SLOWER — one matmul over 3114 positions
+    ///   beats six over 512 — so this is not a latency win by itself. It exists
+    ///   so prefill can be overlapped with vision: image tokens are a
+    ///   contiguous block, so a strip's tokens can be prefilled on the GPU
+    ///   while the ANE encodes the next strip. At 36 slices that is
+    ///   max(1188, 1564) instead of 1188 + 1564.
+    ///
+    ///   Chunk coarsely. Per-strip (64 positions) gives the most overlap and
+    ///   the worst GPU efficiency; 4-8 strips keeps nearly all the overlap.
     public func labsPrefill(
-        _ input: LMInput, imageFeatures: MLXArray?, cache: [any KVCache]
+        _ input: LMInput, imageFeatures: MLXArray?, cache: [any KVCache],
+        chunkSize: Int = 0
     ) throws {
         var inputIds = input.text.tokens
         if inputIds.ndim == 1 {
@@ -949,11 +967,23 @@ public class MiniCPMV46: Module, VLMModel {
         }
 
         let typedCache: [KVCache?]? = cache.isEmpty ? nil : cache.map { $0 }
-        // Prefill discards the logits, so do not materialize 656 MB of them.
-        _ = languageModel(
-            inputIds, inputsEmbeds: inputEmbeddings, cache: typedCache,
-            lastPositionOnly: true)
-        eval(cache)
+        let total = inputIds.dim(1)
+        let step = chunkSize > 0 ? min(chunkSize, total) : total
+
+        var start = 0
+        while start < total {
+            let end = min(start + step, total)
+            // The cache carries its own offset, so each pass appends at the
+            // right positions — the same mechanism decode uses.
+            let ids = inputIds[0..., start ..< end]
+            let embeds = inputEmbeddings.map { $0[0..., start ..< end] }
+            // Prefill discards the logits, so do not materialize 656 MB of them.
+            _ = languageModel(
+                ids, inputsEmbeds: embeds, cache: typedCache,
+                lastPositionOnly: true)
+            eval(cache)
+            start = end
+        }
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
