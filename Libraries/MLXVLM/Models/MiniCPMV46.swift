@@ -652,6 +652,11 @@ public class MiniCPMV46: Module, VLMModel {
         // ANE runs uninterrupted.
         var staged = hidden.map { $0.asType(.float16) }
         eval(staged)
+        // Embeddings are materialized, so the patch/position tables are dead
+        // for the rest of the encode. The streamed path already signalled this;
+        // the ANE path was holding all 274 MB of scaffolding to the end.
+        labsLayerStream?.didFinishEmbeddings()
+
         for s in staged.indices {
             guard let out = encoder.runFront(staged[s]) else { return nil }
             hidden[s] = out
@@ -665,6 +670,11 @@ public class MiniCPMV46: Module, VLMModel {
         }
         staged = hidden.map { $0.asType(.float16) }
         eval(staged)
+        // Every strip has been merged; vitMerger's 209 MB is dead before the
+        // second ANE pass, which is the pass with the larger (610 MB) model
+        // resident — so this is exactly where the headroom is worth most.
+        labsLayerStream?.didFinishVitMerger()
+
         for s in staged.indices {
             guard let out = encoder.runBack(staged[s]) else { return nil }
             hidden[s] = out
