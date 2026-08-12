@@ -641,8 +641,19 @@ public class MiniCPMV46: Module, VLMModel {
         var gridH = strips.map(\.1)
         var gridW = strips.map(\.2)
 
-        for s in hidden.indices {
-            guard let out = encoder.runFront(hidden[s]) else { return nil }
+        // Materialize every strip in ONE eval rather than one per strip.
+        //
+        // MLX is lazy: nothing runs until eval() or a read, and eval() blocks
+        // the CPU until the GPU is done. Handing a strip to CoreML requires
+        // reading it, so a per-strip eval means 9 blocking round-trips per pass
+        // — 18 per image — with the GPU waking, doing one strip, then idling
+        // while the ANE works. The strips are independent, so one submission
+        // covers all of them and the GPU then stays out of the way while the
+        // ANE runs uninterrupted.
+        var staged = hidden.map { $0.asType(.float16) }
+        eval(staged)
+        for s in staged.indices {
+            guard let out = encoder.runFront(staged[s]) else { return nil }
             hidden[s] = out
         }
         for s in hidden.indices {
@@ -652,8 +663,10 @@ public class MiniCPMV46: Module, VLMModel {
             gridH[s] = mh
             gridW[s] = mw
         }
-        for s in hidden.indices {
-            guard let out = encoder.runBack(hidden[s]) else { return nil }
+        staged = hidden.map { $0.asType(.float16) }
+        eval(staged)
+        for s in staged.indices {
+            guard let out = encoder.runBack(staged[s]) else { return nil }
             hidden[s] = out
         }
         // post_layernorm is already applied inside runBack.
