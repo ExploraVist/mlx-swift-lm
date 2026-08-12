@@ -82,6 +82,27 @@ public struct MiniCPMV46Configuration: Codable, Sendable {
     }
 }
 
+// MARK: - Neural Engine encoder hook
+
+/// Supplies the vision encoder's layer stack from outside the model, so it can
+/// run on the Apple Neural Engine via CoreML rather than on the GPU via MLX.
+///
+/// MLX cannot target the ANE — it is a Metal framework, and the ANE has no
+/// public compute API at all, so CoreML is the only way in. That makes this a
+/// hand-off rather than a backend: the app compiles the layers into CoreML
+/// models and hands them back through this protocol.
+///
+/// Both calls take and return `[1, L, D]` in MLX's channels-last layout. The
+/// conforming type is responsible for the transpose into the ANE's preferred
+/// (B, C, 1, S) form and back.
+public protocol LabsANEVisionEncoder: AnyObject {
+    /// Encoder layers `0...insertLayerId`. Return nil to decline (falls back
+    /// to MLX) — e.g. when `L` is not a length the model was compiled for.
+    func runFront(_ x: MLXArray) -> MLXArray?
+    /// Encoder layers `insertLayerId+1..<count`, followed by post_layernorm.
+    func runBack(_ x: MLXArray) -> MLXArray?
+}
+
 // MARK: - Vision (SigLIP2)
 
 private enum MiniCPMV46Vision {
@@ -585,6 +606,63 @@ public class MiniCPMV46: Module, VLMModel {
     public var labsBatchStrips = false
     public var labsLayerStream: LabsLayerStream?
 
+    /// An external implementation of the encoder layer stack, so Labs can run
+    /// those layers on the Apple Neural Engine through CoreML instead of on
+    /// the GPU through MLX.
+    ///
+    /// The split is at `insertLayerId` (6 of 27) for two reasons. iOS caps an
+    /// ANE model at ~1 GB of weights — the same limit that makes Apple's own
+    /// ml-stable-diffusion ship a `--chunk-unet` flag — and 27 layers is
+    /// 823 MB, uncomfortably close. And the sequence length changes here
+    /// anyway when vitMerger does its 2x2 merge (1024 -> 256), so cutting here
+    /// makes each half statically shaped, which the ANE requires.
+    ///
+    /// vitMerger itself deliberately stays in MLX: its window regrouping is
+    /// the op most likely to fail ANE compilation, and it is only 209 MB.
+    ///
+    /// Returning nil from either call falls the whole encode back to the MLX
+    /// path — used when a strip's sequence length is not one the compiled
+    /// model was built for.
+    public var labsANEEncoder: (any LabsANEVisionEncoder)?
+
+    /// Vision encode with the layer stack on the Neural Engine.
+    ///
+    /// MLX still does the embeddings, vitMerger and the final merger; the ANE
+    /// does layers 0...insertLayerId and insertLayerId+1..<27 plus
+    /// post_layernorm, which is 823 MB of the tower's 1097 MB and essentially
+    /// all of its compute.
+    private func visionFeaturesANE(
+        strips: [(MLXArray, Int, Int)], encoder: any LabsANEVisionEncoder
+    ) -> [MLXArray]? {
+        var hidden: [MLXArray] = strips.map { (strip, h, w) in
+            visionTower.embeddings(strip: strip, h: h, w: w)
+                .expandedDimensions(axis: 0)
+        }
+        var gridH = strips.map(\.1)
+        var gridW = strips.map(\.2)
+
+        for s in hidden.indices {
+            guard let out = encoder.runFront(hidden[s]) else { return nil }
+            hidden[s] = out
+        }
+        for s in hidden.indices {
+            let (merged, mh, mw) = vitMerger(
+                hidden[s][0], gridH: gridH[s], gridW: gridW[s])
+            hidden[s] = merged.expandedDimensions(axis: 0)
+            gridH[s] = mh
+            gridW[s] = mw
+        }
+        for s in hidden.indices {
+            guard let out = encoder.runBack(hidden[s]) else { return nil }
+            hidden[s] = out
+        }
+        // post_layernorm is already applied inside runBack.
+        return hidden.indices.map { s in
+            let (tokens, _, _) = merger(
+                hidden[s][0], gridH: gridH[s], gridW: gridW[s])
+            return tokens
+        }
+    }
 
     /// Number of vision encoder layers, so Labs can address them by index.
     public var labsVisionLayerCount: Int { visionTower.encoder.layers.count }
@@ -810,10 +888,13 @@ public class MiniCPMV46: Module, VLMModel {
         // Streaming implies the inverted loop. Batching alone also uses it,
         // since batching same-shaped strips is only expressible with strips
         // on the inside — visionFeatures handles exactly one strip.
+        // The ANE path is tried first when one is attached, and falls through
+        // to MLX if it declines (unsupported sequence length).
         let features: [MLXArray] =
-            (labsLayerStream != nil || labsBatchStrips)
-            ? visionFeaturesStreamed(strips: strips)
-            : strips.map { visionFeatures(strip: $0.0, h: $0.1, w: $0.2) }
+            labsANEEncoder.flatMap { visionFeaturesANE(strips: strips, encoder: $0) }
+            ?? ((labsLayerStream != nil || labsBatchStrips)
+                ? visionFeaturesStreamed(strips: strips)
+                : strips.map { visionFeatures(strip: $0.0, h: $0.1, w: $0.2) })
 
         let imageFeatures = concatenated(features, axis: 0)
         eval(imageFeatures)
