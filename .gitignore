@@ -102,3 +102,6 @@ pyproject.toml
 uv.lock
 main.py
 
+
+.xcbuild/
+default.profraw

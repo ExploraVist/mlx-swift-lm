@@ -433,10 +433,26 @@ private final class MiniCPMV46LanguageModel: Module {
 
     /// MiniCPM-V injects vision via inputs_embeds; positions are plain
     /// sequential ids broadcast to the 3 MRoPE axes (see language.py).
+    /// When true, only the LAST position is projected to vocabulary.
+    ///
+    /// Prefill exists to populate the cache; its logits are discarded. But
+    /// the projection runs over every prompt position first, and with a
+    /// 248,094-token vocabulary that tensor is enormous:
+    ///
+    ///     1322 tokens x 248,094 vocab x 2 B = 656 MB
+    ///
+    /// which matches the measured 714 MB gap between the llmLoad phase
+    /// (746 MB) and the prefill peak (1460 MB). The KV cache is NOT the
+    /// culprit — only 6 of 24 layers are full-attention, so it is ~16 MB.
+    ///
+    /// Slicing to the final position makes it 1 x 248,094 x 2 B = 0.5 MB.
+    /// Decode is unaffected: it passes one token at a time, so last-position
+    /// and all-positions are the same thing there.
     func callAsFunction(
         _ inputs: MLXArray,
         inputsEmbeds: MLXArray? = nil,
-        cache: [KVCache?]? = nil
+        cache: [KVCache?]? = nil,
+        lastPositionOnly: Bool = false
     ) -> MLXArray {
         let inputs2d = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let batch = inputs2d.dim(0)
@@ -452,6 +468,11 @@ private final class MiniCPMV46LanguageModel: Module {
 
         var out = model(
             inputs2d, inputsEmbeds: inputsEmbeds, cache: cache, positionIds: positions)
+
+        // Drop every position but the last BEFORE the vocabulary projection.
+        if lastPositionOnly, out.dim(1) > 1 {
+            out = out[0..., (out.dim(1) - 1)...]
+        }
 
         if let lmHead {
             out = lmHead(out)
@@ -563,6 +584,7 @@ public class MiniCPMV46: Module, VLMModel {
     /// Applies to the normal path as well as the streamed one.
     public var labsBatchStrips = false
     public var labsLayerStream: LabsLayerStream?
+
 
     /// Number of vision encoder layers, so Labs can address them by index.
     public var labsVisionLayerCount: Int { visionTower.encoder.layers.count }
@@ -823,7 +845,10 @@ public class MiniCPMV46: Module, VLMModel {
         }
 
         let typedCache: [KVCache?]? = cache.isEmpty ? nil : cache.map { $0 }
-        _ = languageModel(inputIds, inputsEmbeds: inputEmbeddings, cache: typedCache)
+        // Prefill discards the logits, so do not materialize 656 MB of them.
+        _ = languageModel(
+            inputIds, inputsEmbeds: inputEmbeddings, cache: typedCache,
+            lastPositionOnly: true)
         eval(cache)
     }
 
