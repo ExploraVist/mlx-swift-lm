@@ -924,6 +924,157 @@ public class MiniCPMV46: Module, VLMModel {
         return imageFeatures
     }
 
+    /// Vision and prefill, OVERLAPPED.
+    ///
+    /// The ANE and the GPU are separate silicon, and today exactly one of them
+    /// is working at any moment: the GPU idles through the entire ANE encode,
+    /// then the ANE idles through prefill. Serially that is vision + prefill;
+    /// overlapped it is max(vision, prefill).
+    ///
+    /// The overlap needs no threads and no extra queues, because **MLX is
+    /// lazy**. Issuing prefill operations without eval() queues them on the GPU
+    /// and returns immediately; the next CoreML prediction then blocks on the
+    /// ANE while the GPU works through that queue. Only the final eval waits.
+    ///
+    /// Correctness is the same argument as chunked prefill: image tokens are a
+    /// contiguous, ordered block in the prompt, attention is causal, and the
+    /// cache is built left to right. Once strip s is encoded, every prompt
+    /// position up to the end of its `<|image_pad|>` run is known, and
+    /// prefilling it is exactly as valid as prefilling the whole prompt at
+    /// once.
+    ///
+    /// Requires an attached `labsANEEncoder`; without one there is nothing to
+    /// overlap with and this throws so the caller uses the normal path.
+    ///
+    /// - Parameter stripsPerChunk: strips encoded before a prefill is issued.
+    ///   Smaller means finer overlap and worse GPU efficiency (one matmul over
+    ///   N positions beats several over N/k); larger means the reverse.
+    public func labsEncodeAndPrefillOverlapped(
+        _ input: LMInput, cache: [any KVCache], stripsPerChunk: Int = 3
+    ) throws -> MLXArray {
+        guard let encoder = labsANEEncoder else {
+            throw MiniCPMV46Error.imageProcessingFailed(
+                "labsEncodeAndPrefillOverlapped: no ANE encoder attached")
+        }
+        guard let image = input.image, let frames = image.frames, !frames.isEmpty else {
+            throw MiniCPMV46Error.imageProcessingFailed("no image")
+        }
+
+        var pixels = image.pixels
+        if pixels.ndim == 4 { pixels = pixels[0] }
+        let patch = pixels.dim(0)
+        var strips: [(MLXArray, Int, Int)] = []
+        var cursor = 0
+        for frame in frames {
+            let widthPx = frame.h * frame.w * patch
+            strips.append((pixels[0..., cursor ..< (cursor + widthPx), 0...], frame.h, frame.w))
+            cursor += widthPx
+        }
+
+        var inputIds = input.text.tokens
+        if inputIds.ndim == 1 { inputIds = inputIds.expandedDimensions(axis: 0) }
+        let total = inputIds.dim(1)
+        let textEmbeds = languageModel.model.embedTokens(inputIds)
+        let typedCache: [KVCache?]? = cache.isEmpty ? nil : cache.map { $0 }
+
+        // Prompt positions holding an image placeholder, in order. The s-th
+        // strip's tokens land in a contiguous run of these.
+        let idsHost = inputIds[0].asArray(Int32.self)
+        var padAt: [Int] = []
+        padAt.reserveCapacity(idsHost.count)
+        for (i, t) in idsHost.enumerated() where t == Int32(config.imageTokenId) {
+            padAt.append(i)
+        }
+
+        // ---- vision: embeddings, ANE front, vitMerger (all strips) ----
+        var hidden: [MLXArray] = strips.map { (strip, h, w) in
+            visionTower.embeddings(strip: strip, h: h, w: w).expandedDimensions(axis: 0)
+        }
+        var gridH = strips.map(\.1)
+        var gridW = strips.map(\.2)
+
+        var staged = hidden.map { $0.asType(.float16) }
+        eval(staged)
+        labsLayerStream?.didFinishEmbeddings()
+        for s in staged.indices {
+            guard let out = encoder.runFront(staged[s]) else {
+                throw MiniCPMV46Error.imageProcessingFailed(
+                    "ANE declined a strip; use the non-overlapped path")
+            }
+            hidden[s] = out
+        }
+        for s in hidden.indices {
+            let (merged, mh, mw) = vitMerger(hidden[s][0], gridH: gridH[s], gridW: gridW[s])
+            hidden[s] = merged.expandedDimensions(axis: 0)
+            gridH[s] = mh
+            gridW[s] = mw
+        }
+        staged = hidden.map { $0.asType(.float16) }
+        eval(staged)
+        labsLayerStream?.didFinishVitMerger()
+
+        // ---- ANE back pass, interleaved with prefill on the GPU ----
+        var features: [MLXArray] = []
+        var featuresFlushed = 0   // features already scattered into the cache
+        var padsDone = 0          // image tokens produced so far
+        var padsPrefilled = 0     // image tokens already in the cache
+        var promptDone = 0        // prompt positions already in the cache
+
+        func flush(upToPad pad: Int) throws {
+            guard pad > padsPrefilled, pad <= padAt.count,
+                  featuresFlushed < features.count else { return }
+            let end = padAt[pad - 1] + 1
+            guard end > promptDone else { return }
+            let ids = inputIds[0..., promptDone ..< end]
+            let embeds = textEmbeds[0..., promptDone ..< end]
+            // Everything appended since the last flush covers exactly the pads
+            // between padsPrefilled and pad — features are produced in strip
+            // order and each strip fills a contiguous run.
+            let feats = concatenated(
+                Array(features[featuresFlushed ..< features.count]), axis: 0)
+            let scattered = try scatterImageFeatures(
+                features: feats.asType(textEmbeds.dtype), embeds: embeds,
+                inputIds: ids, placeholderId: config.imageTokenId)
+            // NO eval — this is the whole point. The work queues on the GPU and
+            // the next ANE prediction runs against it.
+            _ = languageModel(ids, inputsEmbeds: scattered, cache: typedCache,
+                              lastPositionOnly: true)
+            featuresFlushed = features.count
+            padsPrefilled = pad
+            promptDone = end
+        }
+
+        for s in staged.indices {
+            guard let out = encoder.runBack(staged[s]) else {
+                throw MiniCPMV46Error.imageProcessingFailed(
+                    "ANE declined a strip; use the non-overlapped path")
+            }
+            let h = visionTower.postLayerNorm(out)[0]
+            let (tokens, _, _) = merger(h, gridH: gridH[s], gridW: gridW[s])
+            features.append(tokens)
+            padsDone += tokens.dim(0)
+
+            if (s + 1) % max(stripsPerChunk, 1) == 0 {
+                try flush(upToPad: padsDone)
+            }
+        }
+        try flush(upToPad: padsDone)
+
+        // Tail: everything after the last image token (question, assistant
+        // preamble). No image features involved.
+        if promptDone < total {
+            let ids = inputIds[0..., promptDone ..< total]
+            let embeds = textEmbeds[0..., promptDone ..< total]
+            _ = languageModel(ids, inputsEmbeds: embeds, cache: typedCache,
+                              lastPositionOnly: true)
+        }
+        eval(cache)
+
+        let imageFeatures = concatenated(features, axis: 0)
+        eval(imageFeatures)
+        return imageFeatures
+    }
+
     /// LLM half only: embed tokens, scatter `imageFeatures` into the
     /// `<|image_pad|>` positions (when given), and run one forward pass into
     /// `cache`, discarding logits (prefill-only). The cache is evaluated
