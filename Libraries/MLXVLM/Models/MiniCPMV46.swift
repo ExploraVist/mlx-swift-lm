@@ -19,6 +19,40 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Instrumentation
+
+/// Opt-in timing for callers that need the vision encoder's cost apart from the language
+/// model's prefill (both otherwise land in one lazy evaluation at the first token).
+///
+/// When `visionEncoded` is set, `MiniCPMV46.prepare` evaluates the image features eagerly
+/// and reports the wall time of the vision pass (tower, VitMerger and Merger) in
+/// milliseconds. Unset, the default, `prepare` behaves exactly as before.
+public enum MiniCPMV46Instrumentation {
+    private static let storage = HookStorage()
+
+    public static var visionEncoded: (@Sendable (Double) -> Void)? {
+        get { storage.get() }
+        set { storage.set(newValue) }
+    }
+
+    private final class HookStorage: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hook: (@Sendable (Double) -> Void)?
+
+        func get() -> (@Sendable (Double) -> Void)? {
+            lock.lock()
+            defer { lock.unlock() }
+            return hook
+        }
+
+        func set(_ newValue: (@Sendable (Double) -> Void)?) {
+            lock.lock()
+            hook = newValue
+            lock.unlock()
+        }
+    }
+}
+
 // MARK: - Configuration
 
 public struct MiniCPMV46Configuration: Codable, Sendable {
@@ -540,6 +574,8 @@ public class MiniCPMV46: Module, VLMModel {
         var inputEmbeddings: MLXArray? = nil
 
         if let image = input.image, let frames = image.frames, !frames.isEmpty {
+            let visionHook = MiniCPMV46Instrumentation.visionEncoded
+            let visionStart = DispatchTime.now().uptimeNanoseconds
             let textEmbeds = languageModel.model.embedTokens(inputIds)
 
             // pixels: [1, patch, totalWidth, C] — slices concatenated on width.
@@ -561,6 +597,10 @@ public class MiniCPMV46: Module, VLMModel {
             }
             let imageFeatures = concatenated(features, axis: 0)
                 .asType(textEmbeds.dtype)
+            if let visionHook {
+                eval(imageFeatures)
+                visionHook(Double(DispatchTime.now().uptimeNanoseconds - visionStart) / 1_000_000)
+            }
 
             inputEmbeddings = try scatterImageFeatures(
                 features: imageFeatures,
