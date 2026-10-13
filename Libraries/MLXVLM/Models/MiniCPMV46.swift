@@ -8,7 +8,12 @@
 //  final 2x2 Merger, 16x token downsample) + Qwen3.5-0.8B hybrid LLM
 //  (reused from Qwen35.swift / Qwen35Language.Model).
 //
-//  Checkpoint: mlx-community/MiniCPM-V-4.6-4bit
+//  MiniCPM-V 4.7 (`minicpmv4_7`) runs on the same classes: identical vision tower,
+//  mergers and Qwen3.5 layers, an untied `lm_head`, "canvas" M-RoPE positions
+//  (MiniCPMVCanvasRoPE.swift) and the chat-template prompt layout without the
+//  `( … )` image wrapping (`MiniCPMVProcessor.PromptLayout.v47`).
+//
+//  Checkpoints: mlx-community/MiniCPM-V-4.6-4bit, mlx-community/MiniCPM-V-4.7-1B-4bit
 //  Weight namespaces (already MLX-sanitized at conversion):
 //    language_model.model.*   vision_tower.*   vit_merger.*   merger.mlp.*
 //
@@ -105,6 +110,38 @@ public struct MiniCPMV46Configuration: Codable, Sendable {
     private let _dropVisionLastLayer: Bool?
     public var dropVisionLastLayer: Bool { _dropVisionLastLayer ?? false }
 
+    // MiniCPM-V 4.7 (`minicpmv4_7`) fields. Absent from 4.6 configs.
+
+    /// `"canvas"` on 4.7: thumbnails and slices get 2-D positions on a shared canvas
+    /// (see ``MiniCPMVCanvasRoPE``). `nil` on 4.6, which uses plain sequential positions.
+    public let mropeMode: String?
+    private let _downsampleMode: String?
+    /// `"16x"` (default) or `"4x"` visual token downsampling.
+    public var downsampleMode: String { _downsampleMode ?? "16x" }
+    private let _imageStartId: Int?
+    private let _imageEndId: Int?
+    private let _sliceStartId: Int?
+    private let _sliceEndId: Int?
+    private let _newlineId: Int?
+
+    /// 4.7 always uses canvas positions (transformers has no switch for it); `mrope_mode`
+    /// is only written by the mlx-vlm conversion.
+    public var usesCanvasRoPE: Bool { mropeMode == "canvas" || modelType == "minicpmv4_7" }
+
+    /// Patch-grid to token-grid factor per side used by the canvas layout.
+    public var canvasMergeFactor: Int { downsampleMode == "4x" ? 2 : 4 }
+
+    public var canvasMarkers: MiniCPMVCanvasRoPE.Markers {
+        let defaults = MiniCPMVCanvasRoPE.Markers.minicpmV47
+        return .init(
+            imageTokenId: imageTokenId,
+            imageStartId: _imageStartId ?? defaults.imageStartId,
+            imageEndId: _imageEndId ?? defaults.imageEndId,
+            sliceStartId: _sliceStartId ?? defaults.sliceStartId,
+            sliceEndId: _sliceEndId ?? defaults.sliceEndId,
+            newlineId: _newlineId ?? defaults.newlineId)
+    }
+
     enum CodingKeys: String, CodingKey {
         case textConfiguration = "text_config"
         case visionConfiguration = "vision_config"
@@ -113,6 +150,13 @@ public struct MiniCPMV46Configuration: Codable, Sendable {
         case _videoTokenId = "video_token_id"
         case _insertLayerId = "insert_layer_id"
         case _dropVisionLastLayer = "drop_vision_last_layer"
+        case mropeMode = "mrope_mode"
+        case _downsampleMode = "downsample_mode"
+        case _imageStartId = "image_start_id"
+        case _imageEndId = "image_end_id"
+        case _sliceStartId = "slice_start_id"
+        case _sliceEndId = "slice_end_id"
+        case _newlineId = "newline_id"
     }
 }
 
@@ -465,24 +509,37 @@ private final class MiniCPMV46LanguageModel: Module {
 
     var faIdx: Int { model.faIdx }
 
-    /// MiniCPM-V injects vision via inputs_embeds; positions are plain
-    /// sequential ids broadcast to the 3 MRoPE axes (see language.py).
+    /// Offset of the next token in the KV cache (0 without a cache).
+    func cacheOffset(_ cache: [KVCache?]?) -> Int {
+        if let cache, let fa = cache[model.faIdx] {
+            return fa.offset
+        }
+        return 0
+    }
+
+    /// MiniCPM-V injects vision via inputs_embeds. Without explicit `positionIds`,
+    /// positions are sequential ids (`cacheOffset + ropeDelta + i`) broadcast to the
+    /// 3 MRoPE axes (see language.py); 4.6 always uses `ropeDelta == 0`. 4.7 passes its
+    /// canvas positions ([3, B, L]) for the prompt and its delta while decoding.
     func callAsFunction(
         _ inputs: MLXArray,
         inputsEmbeds: MLXArray? = nil,
-        cache: [KVCache?]? = nil
+        cache: [KVCache?]? = nil,
+        positionIds: MLXArray? = nil,
+        ropeDelta: Int = 0
     ) -> MLXArray {
         let inputs2d = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let batch = inputs2d.dim(0)
         let seqLen = inputs2d.dim(1)
 
-        var offset = 0
-        if let cache, let fa = cache[model.faIdx] {
-            offset = fa.offset
+        var positions: MLXArray
+        if let positionIds {
+            positions = positionIds
+        } else {
+            let start = cacheOffset(cache) + ropeDelta
+            positions = MLXArray(start ..< (start + seqLen)).asType(.int32)
+            positions = broadcast(positions[.newAxis, .newAxis, 0...], to: [3, batch, seqLen])
         }
-
-        var positions = MLXArray(offset ..< (offset + seqLen)).asType(.int32)
-        positions = broadcast(positions[.newAxis, .newAxis, 0...], to: [3, batch, seqLen])
 
         var out = model(
             inputs2d, inputsEmbeds: inputsEmbeds, cache: cache, positionIds: positions)
@@ -611,16 +668,48 @@ public class MiniCPMV46: Module, VLMModel {
         }
 
         let typedCache: [KVCache?]? = cache.isEmpty ? nil : cache.map { $0 }
+        var positionIds: MLXArray? = nil
+        if config.usesCanvasRoPE {
+            positionIds = try canvasPositionIds(
+                inputIds: inputIds, frames: input.image?.frames ?? [],
+                cacheOffset: languageModel.cacheOffset(typedCache))
+        }
         let logits = languageModel(
-            inputIds, inputsEmbeds: inputEmbeddings, cache: typedCache)
+            inputIds, inputsEmbeds: inputEmbeddings, cache: typedCache, positionIds: positionIds)
         return .logits(LMOutput(logits: logits))
+    }
+
+    /// 4.7 canvas M-RoPE: `max(position) + 1 - length` of the prompt, so decode steps use
+    /// `cacheOffset + ropeDelta` on all three axes. Kept on the model rather than in
+    /// `LMOutput.State` because `TokenIterator.prepare` drops the state of a `.logits`
+    /// prepare result. Set by every `prepare`; always 0 for 4.6.
+    private var ropeDelta = 0
+
+    /// Prompt positions [3, 1, L] for canvas M-RoPE; updates `ropeDelta`.
+    ///
+    /// A prompt that continues a non-empty cache (multi-turn reuse) is laid out on its own
+    /// and shifted past the positions already in the cache.
+    private func canvasPositionIds(inputIds: MLXArray, frames: [THW], cacheOffset: Int) throws
+        -> MLXArray
+    {
+        let ids = inputIds[0].asArray(Int32.self).map(Int.init)
+        let (positions, delta) = try MiniCPMVCanvasRoPE.positionIds(
+            inputIds: ids, grids: frames.map { ($0.h, $0.w) }, markers: config.canvasMarkers,
+            mergeFactor: config.canvasMergeFactor)
+        let priorDelta = cacheOffset > 0 ? ropeDelta : 0
+        let base = cacheOffset + priorDelta
+        ropeDelta = priorDelta + delta
+        let flat = positions.flatMap { $0.map { Int32($0 + base) } }
+        return MLXArray(flat, [3, 1, ids.count])
     }
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state _: LMOutput.State?
     ) -> LMOutput {
         let typedCache: [KVCache?]? = cache.map { c in c.map { $0 } }
-        let logits = languageModel(input.tokens, inputsEmbeds: nil, cache: typedCache)
+        let logits = languageModel(
+            input.tokens, inputsEmbeds: nil, cache: typedCache,
+            ropeDelta: config.usesCanvasRoPE ? ropeDelta : 0)
         return LMOutput(logits: logits)
     }
 
@@ -748,19 +837,31 @@ public struct MiniCPMVProcessorConfiguration: Codable, Sendable {
         self.patchSize = try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? 14
         self.useImageId = try c.decodeIfPresent(Bool.self, forKey: .useImageId) ?? true
         self.sliceMode = try c.decodeIfPresent(Bool.self, forKey: .sliceMode) ?? true
-        self.imageMean = try c.decodeIfPresent([CGFloat].self, forKey: .imageMean) ?? [
-            0.5, 0.5, 0.5,
-        ]
+        self.imageMean =
+            try c.decodeIfPresent([CGFloat].self, forKey: .imageMean) ?? [
+                0.5, 0.5, 0.5,
+            ]
         self.imageStd = try c.decodeIfPresent([CGFloat].self, forKey: .imageStd) ?? [0.5, 0.5, 0.5]
     }
 }
 
 public final class MiniCPMVProcessor: UserInputProcessor {
 
+    /// How the image block is wrapped in the user turn.
+    public enum PromptLayout: Sendable {
+        /// MiniCPM-V 4.6: `(<image_id>0</image_id><image>…</image><slice>…</slice>)\n{prompt}`.
+        case v46
+        /// MiniCPM-V 4.7 chat template: the `<|image_pad|>` item renders as
+        /// `<image_id>0</image_id><image>…</image><slice>…</slice>` and is joined to the text
+        /// with `\n`, without the parentheses.
+        case v47
+    }
+
     private let config: MiniCPMVProcessorConfiguration
     private let tokenizer: any Tokenizer
+    private let layout: PromptLayout
 
-    // Special token ids (MiniCPM-V 4.6 vocabulary)
+    // Special token ids (MiniCPM-V 4.6 / 4.7 vocabulary)
     private let imStartId = 248_045  // <|im_start|>
     private let imEndId = 248_046  // <|im_end|>
     private let imageStartId = 248_078  // <image>
@@ -772,15 +873,24 @@ public final class MiniCPMVProcessor: UserInputProcessor {
     private let imagePadId = 248_056  // <|image_pad|> (fill token)
     private let tokenDivisor = 16  // downsample_mode "16x"
 
-    public init(_ config: MiniCPMVProcessorConfiguration, tokenizer: any Tokenizer) {
+    public init(
+        _ config: MiniCPMVProcessorConfiguration, tokenizer: any Tokenizer,
+        layout: PromptLayout = .v46
+    ) {
         self.config = config
         self.tokenizer = tokenizer
+        self.layout = layout
     }
 
     // MARK: image slicing math (exact port of processing_minicpmv4_6.py)
 
+    /// `max(round(length / patchSize) * patchSize, patchSize)`. Python's `round` is
+    /// half-to-even (e.g. 364 / 56 = 6.5 -> 6); the 4.7 layout matches that. The 4.6 layout
+    /// keeps its original half-away-from-zero rounding so 4.6 output is unchanged.
     private func ensureDivide(_ length: Int, _ patchSize: Int) -> Int {
-        max(Int((Double(length) / Double(patchSize)).rounded()) * patchSize, patchSize)
+        let rule: FloatingPointRoundingRule =
+            layout == .v46 ? .toNearestOrAwayFromZero : .toNearestOrEven
+        return max(Int((Double(length) / Double(patchSize)).rounded(rule)) * patchSize, patchSize)
     }
 
     private func findBestResize(
@@ -953,8 +1063,9 @@ public final class MiniCPMVProcessor: UserInputProcessor {
                         height: CGFloat(cellH)
                     )
                     let cell = refined.cropped(to: rect)
-                        .transformed(by: CGAffineTransform(
-                            translationX: -rect.origin.x, y: -rect.origin.y))
+                        .transformed(
+                            by: CGAffineTransform(
+                                translationX: -rect.origin.x, y: -rect.origin.y))
                     let (strip, sh, sw) = try packedStrip(cell, size: (cellW, cellH))
                     strips.append(strip)
                     frames.append(THW(1, sh, sw))
@@ -969,10 +1080,11 @@ public final class MiniCPMVProcessor: UserInputProcessor {
             frames.append(THW(1, oh, ow))
         }
 
-        // Assemble token ids:
+        // Assemble token ids (4.7 drops the parentheses):
         // <|im_start|>user\n ( [image blocks] )\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+        let (open, close) = layout == .v46 ? ("(", ")") : ("", "")
         var ids: [Int] = [imStartId]
-        ids += encode("user\n(")
+        ids += encode("user\n" + open)
 
         // <image_id>0</image_id>
         if config.useImageId {
@@ -1003,7 +1115,7 @@ public final class MiniCPMVProcessor: UserInputProcessor {
             }
         }
 
-        ids += encode(")\n" + prompt)
+        ids += encode(close + "\n" + prompt)
         ids += [imEndId]
         ids += encode("\n")
         ids += [imStartId]
