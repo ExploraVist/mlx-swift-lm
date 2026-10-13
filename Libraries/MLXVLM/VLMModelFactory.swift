@@ -106,6 +106,7 @@ public enum VLMTypeRegistry {
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "minicpmv4_6": create(MiniCPMV46Configuration.self, MiniCPMV46.init),
+        "minicpmv4_7": create(MiniCPMV46Configuration.self, MiniCPMV46.init),
     ])
 }
 
@@ -141,10 +142,15 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
-        "MiniCPMVProcessor": create(
-            MiniCPMVProcessorConfiguration.self, MiniCPMVProcessor.init),
-        "MiniCPMV4_6Processor": create(
-            MiniCPMVProcessorConfiguration.self, MiniCPMVProcessor.init),
+        "MiniCPMVProcessor": create(MiniCPMVProcessorConfiguration.self) {
+            MiniCPMVProcessor($0, tokenizer: $1)
+        },
+        "MiniCPMV4_6Processor": create(MiniCPMVProcessorConfiguration.self) {
+            MiniCPMVProcessor($0, tokenizer: $1)
+        },
+        "MiniCPMV4_7Processor": create(MiniCPMVProcessorConfiguration.self) {
+            MiniCPMVProcessor($0, tokenizer: $1, layout: .v47)
+        },
     ])
 }
 
@@ -279,6 +285,12 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let minicpmV47_1B_4bit = ModelConfiguration(
+        id: "mlx-community/MiniCPM-V-4.7-1B-4bit",
+        defaultPrompt: "Describe this image.",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     static public func all() -> [ModelConfiguration] {
         [
             paligemma3bMix448_8bit,
@@ -299,6 +311,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
             minicpmV46_4bit,
+            minicpmV47_1B_4bit,
         ]
     }
 
@@ -443,6 +456,8 @@ public final class VLMModelFactory: GenericModelFactory {
         let processorTypeOverrides: [String: String] = [
             "mistral3": "Mistral3Processor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
+            // 4.7 needs its own prompt layout whatever processor_class the files carry.
+            "minicpmv4_7": "MiniCPMV4_7Processor",
         ]
         let processorType =
             processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
@@ -480,9 +495,11 @@ private struct ProcessorConfigError: Error {
 }
 
 /// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
+/// When preprocessor_config.json has no `processor_class` (e.g. mlx-community MiniCPM-V 4.7),
+/// the class name is taken from processor_config.json and the preprocessor data is kept.
 /// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
 /// Throws ProcessorConfigError wrapping any underlying error with the filename.
-private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
+func loadProcessorConfig(from modelDirectory: URL) async throws -> (
     Data, BaseProcessorConfiguration
 ) {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
@@ -491,11 +508,23 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
         FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
         ? preprocessorConfigURL
         : processorConfigURL
+    let data: Data
     do {
-        let data = try Data(contentsOf: url)
+        data = try Data(contentsOf: url)
+    } catch {
+        throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
+    }
+    do {
         let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
+        if url == preprocessorConfigURL,
+            let fallbackData = try? Data(contentsOf: processorConfigURL),
+            let fallback = try? JSONDecoder.json5().decode(
+                BaseProcessorConfiguration.self, from: fallbackData)
+        {
+            return (data, fallback)
+        }
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
     }
 }
